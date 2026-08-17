@@ -1,10 +1,10 @@
-package com.lvl.mds.demo;
+package com.lvl.mds.orderapi;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest
-class DemoApplicationTests {
+class OrderApiApplicationTests {
 
 	@Test
 	void contextLoads() {
