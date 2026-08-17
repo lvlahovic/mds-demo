@@ -36,11 +36,27 @@ public class StreamInitializer {
 			streamOps.createGroup(properties.streamKey(), ReadOffset.from("0"), properties.consumerGroup());
 			log.info("Created consumer group '{}' on stream '{}'", properties.consumerGroup(), properties.streamKey());
 		} catch (DataAccessException ex) {
-			if (ex.getMessage() != null && ex.getMessage().contains("BUSYGROUP")) {
+			if (isBusyGroup(ex)) {
 				log.info("Consumer group '{}' already exists on stream '{}'", properties.consumerGroup(), properties.streamKey());
 			} else {
 				throw ex;
 			}
 		}
+	}
+
+	/**
+	 * Spring Data Redis wraps the driver exception (e.g.
+	 * {@code RedisSystemException}), whose own message is a generic
+	 * "Error in execution" - the actual {@code BUSYGROUP} text from Redis is
+	 * on the cause. Walk the chain instead of checking {@code ex.getMessage()}
+	 * alone.
+	 */
+	private boolean isBusyGroup(Throwable ex) {
+		for (Throwable current = ex; current != null; current = current.getCause()) {
+			if (current.getMessage() != null && current.getMessage().contains("BUSYGROUP")) {
+				return true;
+			}
+		}
+		return false;
 	}
 }
