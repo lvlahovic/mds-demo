@@ -7,7 +7,7 @@ import jakarta.validation.constraints.Positive;
 /**
  * Request payload for {@code POST /orders}.
  */
-public record OrderRequest(
+public record OrderRequestDto(
 
 		@NotBlank(message = "orderId is required")
 		String orderId,

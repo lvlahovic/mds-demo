@@ -1,7 +1,7 @@
 package com.lvl.mds.orderapi.messaging;
 
 import com.lvl.mds.orderapi.config.OrderStreamProperties;
-import com.lvl.mds.orderapi.dto.OrderRequest;
+import com.lvl.mds.orderapi.dto.OrderRequestDto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.connection.stream.MapRecord;
@@ -33,7 +33,7 @@ public class OrderEventPublisher {
 		this.streamKey = streamProperties.streamKey();
 	}
 
-	public RecordId publish(OrderRequest order) {
+	public RecordId publish(OrderRequestDto order) {
 		Map<String, String> fields = new LinkedHashMap<>();
 		fields.put("orderId", order.orderId());
 		fields.put("itemId", order.itemId());

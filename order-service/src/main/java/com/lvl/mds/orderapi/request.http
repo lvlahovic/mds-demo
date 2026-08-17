@@ -6,3 +6,15 @@ Content-Type: application/json
   "itemId": "item-1",
   "quantity": 2
 }
+
+### List all orders
+
+GET http://localhost:8080/orders
+
+### Get a single order
+
+GET http://localhost:8080/orders/123
+
+### Delete an order
+
+DELETE http://localhost:8080/orders/123
