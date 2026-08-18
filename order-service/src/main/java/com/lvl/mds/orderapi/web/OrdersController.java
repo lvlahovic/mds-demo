@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
@@ -50,10 +51,9 @@ public class OrdersController {
 	}
 
 	@GetMapping("/{orderId}")
-	public ResponseEntity<OrderResponseDto> getOrder(@PathVariable String orderId) {
+	public OrderResponseDto getOrder(@PathVariable String orderId) {
 		return orderService.getOrder(orderId)
-				.map(ResponseEntity::ok)
-				.orElseGet(() -> ResponseEntity.notFound().build());
+				.orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order '" + orderId + "' not found"));
 	}
 
 	/**
@@ -69,7 +69,9 @@ public class OrdersController {
 
 	@DeleteMapping("/{orderId}")
 	public ResponseEntity<Void> deleteOrder(@PathVariable String orderId) {
-		boolean deleted = orderService.deleteOrder(orderId);
-		return deleted ? ResponseEntity.noContent().build() : ResponseEntity.notFound().build();
+		if (!orderService.deleteOrder(orderId)) {
+			throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Order '" + orderId + "' not found");
+		}
+		return ResponseEntity.noContent().build();
 	}
 }

@@ -98,6 +98,44 @@ Implementirano (potvrđeno kroz `find` i `git log`):
   cist kraj chunked odgovora (`Connection ... left intact`, bez reset-a), a
   ceo shutdown traje ~1s naspram 30s grace perioda.
 
+- **RFC 7807 ProblemDetail + @RestControllerAdvice (backlog stavka 6) — DONE, 2026-08-18.**
+  Samo `order-service` ima REST API (`inventory-service` je isključivo messaging, bez `web`
+  paketa), pa novi `web.ApiExceptionHandler` živi tamo i nasleđuje Spring-ov
+  `ResponseEntityExceptionHandler` umesto rucno pisanog `@ExceptionHandler` za svaki slucaj —
+  ta bazna klasa vec pretvara ~20 izuzetaka koje sam Spring MVC baca u `ProblemDetail` telo, a
+  `ResponseStatusException` (koji `OrderService` 409 za duplikat `orderId` i
+  `OrderStatusStream` 404 za nepoznatu narudzbinu vec bacaju) je jedan od njih preko
+  `ErrorResponseException` — ta dva mesta nisu ni menjana. Dodato preko toga: `errors` extension
+  member sa listom polja za `@Valid` neuspehe, catch-all `@ExceptionHandler(Exception.class)` za
+  sve sto nije vec u Spring MVC listi (500, generalna poruka ka klijentu, pun stack trace samo u
+  logu — realan slucaj, `OrderService.createOrder` pusta Redis publish gresku kao golu
+  `RuntimeException`, ranije whitelabel/stack trace odgovor), i `type` URI po statusu
+  (`https://order-service.mds-demo/problems/{status-slug}`) prikacen na jednom mestu
+  (`handleExceptionInternal`) tako da ga dobijaju i nasledjeni handleri. `OrdersController`
+  `getOrder`/`deleteOrder` sada bacaju `ResponseStatusException` umesto praznog 404 tela, radi
+  uniformnosti. Gotcha: `ResponseEntityExceptionHandler`-ovi nasledjeni handleri zovu
+  `handleExceptionInternal(ex, null, ...)` — telo se resolvuje na `ex.getBody()` tek UNUTAR
+  default implementacije, pa override koji proverava `body instanceof ProblemDetail` PRE poziva
+  `super` ne vidi nista za `ResponseStatusException` granu; moralo se rucno pozvati
+  `ErrorResponse.getBody()` kad je `body == null`. `spring.mvc.problemdetails.enabled` nije
+  postavljen — taj property samo registruje Boot-ov ekvivalentni advice, uslovljen
+  `@ConditionalOnMissingBean(ResponseEntityExceptionHandler.class)`, pa je no-op cim postoji
+  sopstvena podklasa. Pokriveno `@WebMvcTest` slucajevima u `OrdersControllerTest` (validacija,
+  malformisan JSON, 409, 404, neocekivani izuzetak — sa proverom da poruka izuzetka ne curi u
+  `detail`). Ceo `order-service` test suite prolazi (`mvnw test`, exit 0).
+  **Dopuna istog dana:** kandidat je zatrazio da par specificnih izuzetaka iz order-service-a
+  dobije eksplicitno handlovanje umesto da padne u generalnu 500 kantu. Pregledan svaki
+  `throw new` u `order-service/src/main/java` plus jedino mesto koje sinhrono zove spoljni
+  sistem (`OrderEventPublisher.publish`, pozvan iz `OrderService.createOrder` unutar
+  `POST /orders`) — jedini realan kandidat je bio Redis/broker nedostupnost. Dodat
+  `@ExceptionHandler(DataAccessException.class)` (zajednicki koren u Spring Data za
+  `RedisConnectionFailureException`, `QueryTimeoutException`, `RedisSystemException`, ...) → 503
+  sa `Retry-After: 5` headerom i "probaj ponovo uskoro" porukom, odvojeno od generalnog
+  `Exception.class` → 500 handlera: nedostupan broker nije ista tvrdnja kao "ovaj servis ima
+  bag", i klijent ima koristi od razlikovanja. Ostala dva `throw new` mesta u glavnom kodu
+  (`EventEnvelope`-ovi `IllegalStateException`-i) su na strani konzumovanja rezultata nazad, ne u
+  nekom `@RestController` request putu, pa `ApiExceptionHandler` (kao `@RestControllerAdvice`,
+  ogranicen na MVC dispatcher) tu i ne vazi — nije diran.
 - Dockerfile-ovi za oba servisa, root `docker-compose.yml` (redis:8-alpine +
   `--appendonly yes` + oba servisa).
 - README.md sa uputstvom i arhitekturom.
@@ -181,15 +219,13 @@ fajl izmenjen):
    verifikovana end-to-end kroz `docker compose` — happy path, nedovoljna kolicina,
    nepoznat artikal, duplikat (ponovno objavljivanje ishoda bez duple rezervacije),
    SSE preko restarta konzumera, i ceo lanac retry → DLQ → `FAILED` sa poison porukom.
-   Stavka 2 (event envelope + versioning) je zavrsena u paralelnoj sesiji istog dana
-   (jos nije komitovano u trenutku pisanja ove napomene). Stavka 5 (graceful shutdown)
-   je takodje zavrsena 2026-08-18, opisana iznad. Napomena o konkurentnosti: stavke 2 i
-   5 su rađene u dve odvojene sesije nad istim working tree-om istovremeno — kandidat je
-   to primetio i eksplicitno zatrazio da se pauzira dok se stavka 2 ne zavrsi, pre nego
-   sto je stavka 5 nastavljena i zavrsena. Nista nije izgubljeno (diff-ovi provereni), ali
-   to znaci da radni metod "jedna stavka po sesiji, odvojene sesije" iz backlog memorije
-   nije bio strogo ispostovan ovog dana. Preostale stavke (3, 4, 6-12) i dalje cekaju,
-   redosled izmedju njih nije fiksiran.
+   Stavka 2 (event envelope + versioning) i stavka 5 (graceful shutdown) su takodje
+   zavrsene 2026-08-18 i komitovane zajedno (`4d9b219`) — radjene su u dve odvojene
+   sesije nad istim working tree-om istovremeno, sto je odstupanje od metoda "jedna
+   stavka po sesiji" iz backlog memorije, ali nista nije izgubljeno. Stavka 6 (RFC 7807
+   ProblemDetail + @RestControllerAdvice) je zavrsena 2026-08-18, opisana iznad — working
+   tree je bio cist pre pocetka, metod "jedna stavka po sesiji" je ponovo ispostovan.
+   Preostale stavke (3, 4, 7-12) i dalje cekaju, redosled izmedju njih nije fiksiran.
 
 ## Napomene / ograničenja
 
