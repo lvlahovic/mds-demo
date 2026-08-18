@@ -1,7 +1,11 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.stream;
 
 import com.lvl.mds.inventoryservice.config.RedisStreamProperties;
 import com.lvl.mds.inventoryservice.config.RetryProperties;
+import com.lvl.mds.inventoryservice.messaging.consumers.PendingMessagesReclaimer;
+import com.lvl.mds.inventoryservice.messaging.event.EventFixtures;
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventProcessor;
+import com.lvl.mds.inventoryservice.messaging.producers.ReservationResultPublisher;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.connection.stream.Consumer;
 import org.springframework.data.redis.connection.stream.MapRecord;
@@ -13,7 +17,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.Duration;
 import java.util.List;
-import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -49,9 +52,7 @@ class PendingMessagesReclaimerTest {
 		PendingMessages pending = new PendingMessages("inventory-service-group", List.of(stale));
 		doReturn(pending).when(streamOps).pending(eq("orders-stream"), eq("inventory-service-group"), any(), eq(100L));
 
-		MapRecord<String, String, String> record = MapRecord
-				.create("orders-stream", Map.of("orderId", "order-x", "itemId", "item-1", "quantity", "1"))
-				.withId(id);
+		MapRecord<String, String, String> record = EventFixtures.orderCreated("order-x", "item-1", 1).withId(id);
 		doReturn(List.of(record)).when(streamOps)
 				.claim(eq("orders-stream"), eq("inventory-service-group"), eq("consumer-1"), any(Duration.class), eq(id));
 
@@ -79,9 +80,7 @@ class PendingMessagesReclaimerTest {
 		PendingMessages pending = new PendingMessages("inventory-service-group", List.of(stale));
 		doReturn(pending).when(streamOps).pending(eq("orders-stream"), eq("inventory-service-group"), any(), eq(100L));
 
-		MapRecord<String, String, String> record = MapRecord
-				.create("orders-stream", Map.of("orderId", "order-y", "itemId", "item-1", "quantity", "1"))
-				.withId(id);
+		MapRecord<String, String, String> record = EventFixtures.orderCreated("order-y", "item-1", 1).withId(id);
 		doReturn(List.of(record)).when(streamOps)
 				.claim(eq("orders-stream"), eq("inventory-service-group"), eq("consumer-1"), any(Duration.class), eq(id));
 

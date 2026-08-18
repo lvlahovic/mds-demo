@@ -6,6 +6,8 @@ import com.lvl.mds.orderapi.services.OrderService;
 import com.lvl.mds.orderapi.services.OrderStatusChangedEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import org.springframework.context.SmartLifecycle;
 import org.springframework.context.event.EventListener;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -41,9 +43,21 @@ import java.util.Map;
  * for the scale this exercise runs at that trade is worth the simplicity, and
  * the production answer would be a per-connection queue with dispatch off the
  * caller's thread.
+ *
+ * <p>This is also a {@link SmartLifecycle}, and that is not incidental. With
+ * {@code server.shutdown=graceful} the web server waits for active requests to
+ * finish before it stops, and an SSE subscription is an active (async)
+ * request - one that by design does not finish until the order is decided or
+ * the 5-minute timeout expires. Left alone, a single client watching a pending
+ * order would stall every shutdown until
+ * {@code spring.lifecycle.timeout-per-shutdown-phase} ran out. So the open
+ * emitters are completed here first, one phase above
+ * {@link WebServerApplicationContext#GRACEFUL_SHUTDOWN_PHASE}: clients see a
+ * clean end of stream and reconnect to whatever instance replaces this one,
+ * rather than a connection reset mid-shutdown.
  */
 @Component
-public class OrderStatusStream {
+public class OrderStatusStream implements SmartLifecycle {
 
 	private static final Logger log = LoggerFactory.getLogger(OrderStatusStream.class);
 
@@ -53,6 +67,8 @@ public class OrderStatusStream {
 	private final long timeoutMs;
 
 	private final Map<String, List<SseEmitter>> subscribersByOrderId = new HashMap<>();
+
+	private volatile boolean running;
 
 	public OrderStatusStream(OrderService orderService, OrderStatusStreamProperties properties) {
 		this.orderService = orderService;
@@ -76,9 +92,16 @@ public class OrderStatusStream {
 		synchronized (this) {
 			if (current.status().isTerminal()) {
 				// Already decided: one event, then done - no subscription needed.
-				if (send(orderId, emitter, current)) {
-					emitter.complete();
-				}
+				sendAndComplete(orderId, emitter, current);
+				return emitter;
+			}
+
+			if (!running) {
+				// Shutting down: this instance will never deliver an update, so
+				// answer with the snapshot and close rather than hold open a
+				// connection that only delays the shutdown it raced.
+				log.debug("Refusing to hold a status subscription for order {} during shutdown", orderId);
+				sendAndComplete(orderId, emitter, current);
 				return emitter;
 			}
 
@@ -110,6 +133,57 @@ public class OrderStatusStream {
 		}
 	}
 
+	@Override
+	public void start() {
+		running = true;
+	}
+
+	/**
+	 * Ends every open subscription cleanly. Runs before the web server starts
+	 * waiting for in-flight requests, and after the result stream listener has
+	 * stopped (it sits at {@link Integer#MAX_VALUE}), so any result that
+	 * arrived during shutdown has already been pushed to these clients.
+	 */
+	@Override
+	public synchronized void stop() {
+		running = false;
+
+		List<SseEmitter> open = new ArrayList<>();
+		for (List<SseEmitter> perOrder : subscribersByOrderId.values()) {
+			open.addAll(perOrder);
+		}
+		subscribersByOrderId.clear();
+
+		for (SseEmitter emitter : open) {
+			emitter.complete();
+		}
+
+		if (!open.isEmpty()) {
+			log.info("Closed {} open status subscription(s) before shutdown", open.size());
+		}
+	}
+
+	@Override
+	public boolean isRunning() {
+		return running;
+	}
+
+	/**
+	 * One above the web server's graceful-shutdown phase: higher phases stop
+	 * first, so the subscriptions are closed before anything starts waiting for
+	 * them to close by themselves.
+	 */
+	@Override
+	public int getPhase() {
+		return WebServerApplicationContext.GRACEFUL_SHUTDOWN_PHASE + 1;
+	}
+
+	private void sendAndComplete(String orderId, SseEmitter emitter, OrderResponseDto order) {
+		if (send(orderId, emitter, order)) {
+			emitter.complete();
+		}
+	}
+
 	private boolean send(String orderId, SseEmitter emitter, OrderResponseDto order) {
 		try {
 			emitter.send(SseEmitter.event().name(STATUS_EVENT).data(order, MediaType.APPLICATION_JSON));
@@ -124,8 +198,9 @@ public class OrderStatusStream {
 
 	/**
 	 * Called both directly and from the emitter's own completion callbacks,
-	 * possibly on the thread already inside {@link #onOrderStatusChanged} -
-	 * {@code synchronized} being reentrant is what makes that safe.
+	 * possibly on the thread already inside {@link #onOrderStatusChanged} or
+	 * {@link #stop()} - {@code synchronized} being reentrant is what makes that
+	 * safe.
 	 */
 	private synchronized void detach(String orderId, SseEmitter emitter) {
 		List<SseEmitter> subscribers = subscribersByOrderId.get(orderId);

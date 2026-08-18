@@ -63,6 +63,41 @@ Implementirano (potvrđeno kroz `find` i `git log`):
   `ITEM_NOT_FOUND`. Sada je `@PostConstruct` + `@DependsOn` na listener container-u.
   Otkriveno tek kroz ovu stavku, jer je rezultat ranije zivio samo u logu.
 
+- **Graceful shutdown (backlog stavka 5) — DONE, 2026-08-18.** Novi
+  `messaging.StreamListenerLifecycle` u oba servisa (ista klasa, kopirana kao
+  event contract) preuzima start/stop `StreamMessageListenerContainer`-a kao
+  `SmartLifecycle` na fazi `Integer.MAX_VALUE`: `container.stop()` sam po sebi
+  samo obori flag i vrati se odmah, dok poll thread moze biti usred
+  `onMessage()` — a Redis connection factory (Lettuce) gasi se tek na fazi
+  `0`, pa bi trka do zatvaranja konteksta mogla srusiti zavrsni `XACK` na
+  vec mrtvoj konekciji. `stop()` zato ceka da `Subscription.isActive()`
+  postane `false` (dokaz da je poll thread stvarno izasao iz event loop-a),
+  ograniceno sa `{service}.shutdown.listener-drain-timeout-ms`. Preseljenje
+  `container.start()` iz `@Bean` metode u lifecycle fazu je usput ucvrstilo i
+  `@DependsOn` redosled iz `InventorySeedInitializer` bug-a strukturno (svaki
+  singleton je konstruisan pre bilo kog `start()`-a), a ne samo napomenom u
+  javadoc-u. `web.OrderStatusStream` je takodje `SmartLifecycle`, jedna faza
+  iznad `WebServerApplicationContext.GRACEFUL_SHUTDOWN_PHASE`: zatvara sve
+  otvorene SSE konekcije PRE nego sto Tomcat (uz `server.shutdown=graceful`)
+  pocne da ceka na aktivne requestove — inace bi jedan klijent koji gleda
+  narudzbinu na cekanju blokirao svaki shutdown do isteka
+  `spring.lifecycle.timeout-per-shutdown-phase`. `inventory-service` dodatno
+  ima `spring.task.scheduling.shutdown.await-termination=true` jer
+  `PendingMessagesReclaimer` radi `XCLAIM` → obradi → `XACK` kao jednu
+  celinu — prekid usred tog prolaza bi ostavio poruku "zaklajmovanu" od
+  konzumera koji vise ne postoji. `docker-compose.yml` ima
+  `stop_grace_period: 30s` na oba servisa (Compose default 10s je krace od
+  `timeout-per-shutdown-phase`=20s, pa bi SIGKILL sigurno stigao nasred
+  drenaze). Verifikovano uzivo kroz `docker compose`: gasenje
+  `inventory-service`-a sa neobradjenom porukom ide "Stopping stream
+  listener" → "drained" za ~1s, `XPENDING` posle toga prazan; gasenje
+  `order-service`-a dok `curl -N .../status` drzi otvorenu konekciju na
+  narudzbini koja jos nije `RESERVED` pokazuje redosled: listener drain →
+  "Closed 1 open status subscription(s)" → Tomcat-ov graceful shutdown koji
+  odmah zavrsi jer nema vise sta da ceka; `curl -v` na klijentu potvrdjuje
+  cist kraj chunked odgovora (`Connection ... left intact`, bez reset-a), a
+  ceo shutdown traje ~1s naspram 30s grace perioda.
+
 - Dockerfile-ovi za oba servisa, root `docker-compose.yml` (redis:8-alpine +
   `--appendonly yes` + oba servisa).
 - README.md sa uputstvom i arhitekturom.
@@ -146,7 +181,15 @@ fajl izmenjen):
    verifikovana end-to-end kroz `docker compose` — happy path, nedovoljna kolicina,
    nepoznat artikal, duplikat (ponovno objavljivanje ishoda bez duple rezervacije),
    SSE preko restarta konzumera, i ceo lanac retry → DLQ → `FAILED` sa poison porukom.
-   Sledeca na redu je stavka 2 (event envelope + versioning).
+   Stavka 2 (event envelope + versioning) je zavrsena u paralelnoj sesiji istog dana
+   (jos nije komitovano u trenutku pisanja ove napomene). Stavka 5 (graceful shutdown)
+   je takodje zavrsena 2026-08-18, opisana iznad. Napomena o konkurentnosti: stavke 2 i
+   5 su rađene u dve odvojene sesije nad istim working tree-om istovremeno — kandidat je
+   to primetio i eksplicitno zatrazio da se pauzira dok se stavka 2 ne zavrsi, pre nego
+   sto je stavka 5 nastavljena i zavrsena. Nista nije izgubljeno (diff-ovi provereni), ali
+   to znaci da radni metod "jedna stavka po sesiji, odvojene sesije" iz backlog memorije
+   nije bio strogo ispostovan ovog dana. Preostale stavke (3, 4, 6-12) i dalje cekaju,
+   redosled izmedju njih nije fiksiran.
 
 ## Napomene / ograničenja
 

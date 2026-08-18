@@ -22,6 +22,11 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # Compose's default (10s) is shorter than spring.lifecycle.timeout-per-
+    # shutdown-phase (20s) - SIGKILL would land mid-drain and make the
+    # graceful shutdown pointless. The Dockerfile's exec-form ENTRYPOINT
+    # makes java PID 1, so it receives Compose's SIGTERM directly.
+    stop_grace_period: 30s
 
   inventory-service:
     build: ./inventory-service
@@ -31,6 +36,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # See order-service: same reasoning, same lifecycle phase timeout.
+    stop_grace_period: 30s
 
 volumes:
   redis-data:

@@ -1,5 +1,6 @@
 package com.lvl.mds.inventoryservice.messaging;
 
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventProcessor;
 import com.lvl.mds.inventoryservice.model.ReservationOutcome;
 import org.springframework.stereotype.Component;
 

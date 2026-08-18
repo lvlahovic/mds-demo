@@ -1,4 +1,4 @@
-package com.lvl.mds.orderapi.messaging;
+package com.lvl.mds.orderapi.messaging.consumers;
 
 import com.lvl.mds.orderapi.config.OrderStreamProperties;
 import org.slf4j.Logger;

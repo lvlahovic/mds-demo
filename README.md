@@ -182,6 +182,56 @@ publishes an in-JVM `OrderStatusChangedEvent`, and `OrderStatusStream` in the
 `web` package subscribes to it. That keeps the dependency pointing from web to
 services rather than the other way around.
 
+### Graceful shutdown
+
+`docker compose stop` (and Kubernetes' pod termination) sends `SIGTERM` and
+then waits `stop_grace_period` before escalating to `SIGKILL`. Left alone,
+Spring's default reaction to `SIGTERM` is closer to "stop accepting new
+work and drop everything in flight" than a real drain - three separate
+things needed to actually finish what was in progress:
+
+- **The stream listeners.** `StreamMessageListenerContainer.stop()` on its
+  own just flips a flag and returns; the poll thread can still be inside
+  `onMessage()`. Since the Redis connection factory shuts down later than
+  almost everything else (`SmartLifecycle` phase `0`), letting the context
+  close race ahead means the closing `XACK` can hit a connection that's
+  already gone - reserved, published, but redelivered anyway.
+  `StreamListenerLifecycle` (present in both services, one per listener)
+  wraps the container as a `SmartLifecycle` at phase `Integer.MAX_VALUE`
+  (stops first) and blocks in `stop()` until the subscription reports it
+  actually left the event loop, capped by
+  `{service}.shutdown.listener-drain-timeout-ms` so a wedged consumer can't
+  hold shutdown open forever.
+- **Open SSE connections.** With `server.shutdown=graceful`, Tomcat waits
+  for every active request to finish before it stops - and an SSE
+  subscription is an active request that, by design, doesn't finish until
+  the order is decided. One client watching a pending order would stall
+  every shutdown until the timeout ran out. `OrderStatusStream` is also a
+  `SmartLifecycle`, one phase above Boot's
+  `WebServerApplicationContext.GRACEFUL_SHUTDOWN_PHASE`: it completes every
+  open emitter (clean end of stream, not a reset) before Tomcat starts
+  waiting for anything, and a subscribe attempt that arrives after that
+  point gets the current snapshot and an immediate close instead of a
+  connection that would just outlive the process.
+- **The reclaim job.** `PendingMessagesReclaimer` does `XCLAIM` → process →
+  `XACK` as one unit; killing its thread mid-pass would leave a message
+  claimed by a consumer that no longer exists, waiting out the pending
+  threshold again for nothing. `spring.task.scheduling.shutdown.await-termination=true`
+  lets a running pass finish instead of being interrupted.
+
+`spring.lifecycle.timeout-per-shutdown-phase` (20s) is the backstop above
+all of these, and `stop_grace_period: 30s` in the compose file is set above
+that - a shorter grace period would `SIGKILL` mid-drain and make the whole
+mechanism pointless. Verified live: stopping `inventory-service` with
+`redis-cli` show no message left in the PEL and the log going straight from
+"Stopping stream listener" to "drained" in about 1s; stopping
+`order-service` while an SSE client held a subscription to a still-pending
+order showed the listener drain, then "Closed 1 open status
+subscription(s)", then Tomcat's own graceful shutdown finding nothing left
+to wait for - `curl -v` on the client side confirms a clean end of the
+chunked response (`Connection ... left intact`, no reset), and the whole
+shutdown took about 1 second against a 30-second grace period.
+
 ### Sibling folders, not a Maven multi-module build
 
 `order-service` and `inventory-service` are two independent Maven projects
@@ -231,6 +281,16 @@ These were exercised by hand against `docker compose up --build`:
    opened right after `POST /orders` receives `PUBLISHED` immediately, then
    the terminal status as soon as `inventory-service` reports back, then the
    connection closes. Opening it after the fact yields one event and closes.
+6. **Graceful shutdown** - stop `inventory-service` with a message it hasn't
+   acknowledged yet: the log goes straight from "Stopping stream listener"
+   to "drained", `XPENDING` on `orders-stream` is empty, and the container
+   exits in about a second, well inside the 30s grace period. Stop
+   `order-service` while `curl -N .../status` is attached to a still-`PUBLISHED`
+   order: the log shows the result listener drain, then "Closed 1 open
+   status subscription(s)", then Tomcat's graceful shutdown completing
+   immediately because nothing was left to wait for; the client sees the
+   chunked response end cleanly (`curl -v` reports the connection left
+   intact, no reset).
 
 ## Assumptions
 

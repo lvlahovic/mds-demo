@@ -1,6 +1,7 @@
 package com.lvl.mds.orderapi.messaging;
 
 import com.lvl.mds.orderapi.config.OrderStreamProperties;
+import com.lvl.mds.orderapi.messaging.consumers.ReservationResultProcessor;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

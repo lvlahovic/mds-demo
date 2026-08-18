@@ -1,7 +1,8 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.consumers;
 
 import com.lvl.mds.inventoryservice.config.RedisStreamProperties;
 import com.lvl.mds.inventoryservice.config.RetryProperties;
+import com.lvl.mds.inventoryservice.messaging.producers.ReservationResultPublisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Range;

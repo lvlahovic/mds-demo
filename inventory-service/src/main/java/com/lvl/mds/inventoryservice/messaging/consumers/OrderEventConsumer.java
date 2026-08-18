@@ -1,4 +1,4 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.consumers;
 
 import com.lvl.mds.inventoryservice.config.RedisStreamProperties;
 import org.slf4j.Logger;

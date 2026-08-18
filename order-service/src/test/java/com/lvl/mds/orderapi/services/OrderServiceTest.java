@@ -2,7 +2,7 @@ package com.lvl.mds.orderapi.services;
 
 import com.lvl.mds.orderapi.dto.OrderRequestDto;
 import com.lvl.mds.orderapi.dto.OrderResponseDto;
-import com.lvl.mds.orderapi.messaging.OrderEventPublisher;
+import com.lvl.mds.orderapi.messaging.producers.OrderEventPublisher;
 import com.lvl.mds.orderapi.model.Order;
 import com.lvl.mds.orderapi.model.OrderStatus;
 import com.lvl.mds.orderapi.repository.OrderRepository;

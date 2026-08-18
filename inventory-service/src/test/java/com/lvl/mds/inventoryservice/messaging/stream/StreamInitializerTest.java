@@ -1,6 +1,7 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.stream;
 
 import com.lvl.mds.inventoryservice.config.RedisStreamProperties;
+import com.lvl.mds.inventoryservice.messaging.StreamInitializer;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.data.redis.RedisSystemException;

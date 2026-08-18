@@ -1,5 +1,10 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.processing;
 
+import com.lvl.mds.inventoryservice.messaging.ProcessedOrdersStore;
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventProcessor;
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventReader;
+import com.lvl.mds.inventoryservice.messaging.event.EventFixtures;
+import com.lvl.mds.inventoryservice.messaging.producers.ReservationResultPublisher;
 import com.lvl.mds.inventoryservice.model.ReservationOutcome;
 import com.lvl.mds.inventoryservice.services.InventoryService;
 import org.junit.jupiter.api.Test;
@@ -7,8 +12,6 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.connection.stream.MapRecord;
-
-import java.util.Map;
 
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -25,11 +28,12 @@ class OrderEventProcessorTest {
 
 	private final ProcessedOrdersStore processedOrdersStore = new ProcessedOrdersStore();
 
-	private final MapRecord<String, String, String> record = MapRecord.create("orders-stream",
-			Map.of("orderId", "order-1", "itemId", "item-1", "quantity", "2"));
+	private final MapRecord<String, String, String> record =
+			EventFixtures.orderCreated("order-1", "item-1", 2);
 
 	private OrderEventProcessor newProcessor() {
-		return new OrderEventProcessor(inventoryService, processedOrdersStore, resultPublisher);
+		return new OrderEventProcessor(new OrderEventReader(EventFixtures.MAPPER),
+				inventoryService, processedOrdersStore, resultPublisher);
 	}
 
 	@Test
@@ -69,5 +73,20 @@ class OrderEventProcessorTest {
 
 		verify(resultPublisher, times(2))
 				.publishOutcome("order-1", "item-1", 2, ReservationOutcome.INSUFFICIENT_STOCK);
+	}
+
+	/**
+	 * Deduplication is by orderId, so a genuinely new publication of the same
+	 * order (a different eventId) is still a duplicate.
+	 */
+	@Test
+	void treatsARepublishedOrderAsADuplicateDespiteADifferentEventId() {
+		when(inventoryService.reserve("order-1", "item-1", 2)).thenReturn(ReservationOutcome.RESERVED);
+		OrderEventProcessor processor = newProcessor();
+
+		processor.process(record);
+		processor.process(EventFixtures.orderCreated("order-1", "item-1", 2));
+
+		verify(inventoryService, times(1)).reserve("order-1", "item-1", 2);
 	}
 }

@@ -1,6 +1,8 @@
 package com.lvl.mds.inventoryservice.config;
 
-import com.lvl.mds.inventoryservice.messaging.OrderEventConsumer;
+import com.lvl.mds.inventoryservice.messaging.StreamInitializer;
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventConsumer;
+import com.lvl.mds.inventoryservice.messaging.StreamListenerLifecycle;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.DependsOn;
@@ -20,23 +22,31 @@ import java.time.Duration;
  * {@code @Bean StreamListener} auto-wiring) is used so the poll timeout and
  * consumer/group names are explicit and configurable.
  *
+ * <p>The container is handed to a {@link StreamListenerLifecycle} rather than
+ * exposed as a bean of its own, so that one object owns when consumption
+ * starts and - the part that needs care - when it stops. See that class for
+ * why stopping needs more than {@code container.stop()}.
+ *
  * <p>The {@code @DependsOn} isn't decoration: the container begins polling
  * with {@code XREADGROUP} as soon as it is started, which fails with NOGROUP
- * unless {@link com.lvl.mds.inventoryservice.messaging.StreamInitializer} has
+ * unless {@link StreamInitializer} has
  * already created the consumer group - and it must not consume orders before
  * {@link InventorySeedInitializer} has put any stock in the repository.
- * Nothing else in the wiring guarantees that ordering between a scanned
- * component and a {@code @Bean} method.
+ * Starting from the lifecycle phase now guarantees that ordering on its own,
+ * since every singleton is constructed before any {@code start()} runs; the
+ * annotation stays because it makes the requirement explicit at the point it
+ * is needed rather than resting on that framework detail.
  */
 @Configuration
 public class RedisStreamListenerConfig {
 
-	@Bean(destroyMethod = "stop")
+	@Bean
 	@DependsOn({"streamInitializer", "inventorySeedInitializer"})
-	public StreamMessageListenerContainer<String, MapRecord<String, String, String>> orderStreamListenerContainer(
+	public StreamListenerLifecycle orderStreamListenerLifecycle(
 			RedisConnectionFactory connectionFactory,
 			OrderEventConsumer orderEventConsumer,
-			RedisStreamProperties properties) {
+			RedisStreamProperties properties,
+			ShutdownProperties shutdownProperties) {
 
 		StreamMessageListenerContainerOptions<String, MapRecord<String, String, String>> options =
 				StreamMessageListenerContainerOptions.builder()
@@ -46,13 +56,11 @@ public class RedisStreamListenerConfig {
 		StreamMessageListenerContainer<String, MapRecord<String, String, String>> container =
 				StreamMessageListenerContainer.create(connectionFactory, options);
 
-		container.receive(
+		return new StreamListenerLifecycle(
+				container,
 				Consumer.from(properties.consumerGroup(), properties.consumerName()),
 				StreamOffset.create(properties.streamKey(), ReadOffset.lastConsumed()),
-				orderEventConsumer);
-
-		container.start();
-
-		return container;
+				orderEventConsumer,
+				Duration.ofMillis(shutdownProperties.listenerDrainTimeoutMs()));
 	}
 }

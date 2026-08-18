@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -90,5 +91,56 @@ class OrderStatusStreamTest {
 
 		mockMvc.perform(get("/orders/missing/status"))
 				.andExpect(status().isNotFound());
+	}
+
+	/**
+	 * {@code stop()} is what {@link OrderStatusStream}'s graceful-shutdown
+	 * phase calls: a subscriber watching a still-pending order must see a
+	 * clean end of stream rather than have its connection reset when the
+	 * server actually goes down, and must not be delivered anything that
+	 * arrives afterwards - by then this instance is no longer the one
+	 * publishing results.
+	 */
+	@Test
+	@DirtiesContext
+	void stopClosesOpenSubscriptionsSoTheClientSeesACleanEndOfStream() throws Exception {
+		when(orderService.getOrder("order-1"))
+				.thenReturn(Optional.of(order(OrderStatus.PUBLISHED, "published to orders-stream")));
+
+		MvcResult result = mockMvc.perform(get("/orders/order-1/status"))
+				.andExpect(request().asyncStarted())
+				.andReturn();
+
+		orderStatusStream.stop();
+
+		// Arrives after the subscription was already closed by stop() - must
+		// not be delivered to a subscriber that no longer exists.
+		orderStatusStream.onOrderStatusChanged(
+				new OrderStatusChangedEvent(order(OrderStatus.RESERVED, "reserved 2 of item 'item-1'")));
+
+		assertThat(result.getResponse().getContentAsString())
+				.contains("event:status")
+				.contains("\"status\":\"PUBLISHED\"")
+				.doesNotContain("\"status\":\"RESERVED\"");
+	}
+
+	/**
+	 * Once {@code stop()} has run, this instance will never deliver an
+	 * update - holding a new subscription open would just be a connection
+	 * that outlives the shutdown for no reason, so it gets the snapshot and
+	 * an immediate close instead, the same as an already-decided order.
+	 */
+	@Test
+	@DirtiesContext
+	void subscribingWhileShuttingDownGetsTheSnapshotThenClosesImmediately() throws Exception {
+		when(orderService.getOrder("order-1"))
+				.thenReturn(Optional.of(order(OrderStatus.PUBLISHED, "published to orders-stream")));
+
+		orderStatusStream.stop();
+
+		MvcResult result = mockMvc.perform(get("/orders/order-1/status")).andReturn();
+
+		assertThat(result.getResponse().getContentAsString())
+				.contains("\"status\":\"PUBLISHED\"");
 	}
 }

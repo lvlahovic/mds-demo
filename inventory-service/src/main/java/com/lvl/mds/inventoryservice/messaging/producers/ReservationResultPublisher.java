@@ -1,6 +1,10 @@
-package com.lvl.mds.inventoryservice.messaging;
+package com.lvl.mds.inventoryservice.messaging.producers;
 
 import com.lvl.mds.inventoryservice.config.RedisStreamProperties;
+import com.lvl.mds.inventoryservice.messaging.event.EventEnvelope;
+import com.lvl.mds.inventoryservice.messaging.event.OrderCreatedPayload;
+import com.lvl.mds.inventoryservice.messaging.event.ReservationResultPayload;
+import com.lvl.mds.inventoryservice.messaging.consumers.OrderEventReader;
 import com.lvl.mds.inventoryservice.model.ReservationOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -9,10 +13,10 @@ import org.springframework.data.redis.connection.stream.RecordId;
 import org.springframework.data.redis.core.StreamOperations;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
+import tools.jackson.databind.ObjectMapper;
 
-import java.time.Instant;
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Publishes the outcome of every reservation attempt to
@@ -25,6 +29,10 @@ import java.util.Map;
  * synchronous coupling the broker is there to remove, and would need its own
  * retry story) and over a shared Redis key polled by order-service (no
  * ordering, no redelivery, no backlog if the reader is down).
+ *
+ * <p>Results are wrapped in the same {@link EventEnvelope} as inbound orders:
+ * both legs of the integration speak one message format, and the return leg
+ * gets versioning for free.
  *
  * <p>The wire vocabulary is deliberately a superset of
  * {@link ReservationOutcome}: the domain enum answers "did we reserve?",
@@ -40,40 +48,53 @@ public class ReservationResultPublisher {
 	private static final Logger log = LoggerFactory.getLogger(ReservationResultPublisher.class);
 
 	private final StreamOperations<String, String, String> streamOps;
+	private final OrderEventReader eventReader;
+	private final ObjectMapper objectMapper;
 	private final String resultStreamKey;
 
-	public ReservationResultPublisher(StringRedisTemplate redisTemplate, RedisStreamProperties properties) {
+	public ReservationResultPublisher(StringRedisTemplate redisTemplate,
+			OrderEventReader eventReader,
+			ObjectMapper objectMapper,
+			RedisStreamProperties properties) {
 		this.streamOps = redisTemplate.opsForStream();
+		this.eventReader = eventReader;
+		this.objectMapper = objectMapper;
 		this.resultStreamKey = properties.resultStreamKey();
 	}
 
 	public RecordId publishOutcome(String orderId, String itemId, int quantity, ReservationOutcome outcome) {
-		return publish(orderId, itemId, String.valueOf(quantity), outcome.name(), describe(outcome, itemId, quantity));
+		return publish(new ReservationResultPayload(orderId, itemId, quantity, outcome.name(),
+				describe(outcome, itemId, quantity)));
 	}
 
 	/**
 	 * Reports an order this service has permanently given up on (moved to the
 	 * DLQ). Takes the raw stream record rather than parsed values, because the
-	 * reason a message ends up here can be that its own payload never parsed.
+	 * reason a message ends up here can be that its own payload never
+	 * decoded - in which case the failure is still published, just without an
+	 * order to name.
 	 */
 	public RecordId publishFailure(MapRecord<String, String, String> failedRecord, String reason) {
-		Map<String, String> fields = failedRecord.getValue();
-		return publish(fields.get("orderId"), fields.get("itemId"), fields.get("quantity"), FAILED_OUTCOME, reason);
+		Optional<OrderCreatedPayload> order = eventReader.tryReadPayload(failedRecord);
+
+		return publish(new ReservationResultPayload(
+				order.map(OrderCreatedPayload::orderId).orElse(null),
+				order.map(OrderCreatedPayload::itemId).orElse(null),
+				order.map(OrderCreatedPayload::quantity).orElse(null),
+				FAILED_OUTCOME,
+				reason));
 	}
 
-	private RecordId publish(String orderId, String itemId, String quantity, String outcome, String reason) {
-		Map<String, String> fields = new LinkedHashMap<>();
-		fields.put("orderId", orderId == null ? "" : orderId);
-		fields.put("itemId", itemId == null ? "" : itemId);
-		fields.put("quantity", quantity == null ? "" : quantity);
-		fields.put("outcome", outcome);
-		fields.put("reason", reason);
-		fields.put("processedAt", Instant.now().toString());
+	private RecordId publish(ReservationResultPayload payload) {
+		EventEnvelope<ReservationResultPayload> event =
+				EventEnvelope.of(ReservationResultPayload.EVENT_TYPE, payload);
 
+		Map<String, String> fields = Map.of(EventEnvelope.STREAM_FIELD, objectMapper.writeValueAsString(event));
 		RecordId recordId = streamOps.add(MapRecord.create(resultStreamKey, fields));
 
-		log.info("Published reservation result to stream '{}': orderId={}, outcome={}, streamId={}",
-				resultStreamKey, orderId, outcome, recordId);
+		log.info("Published {} v{} to stream '{}': eventId={}, orderId={}, outcome={}, streamId={}",
+				event.eventType(), event.schemaVersion(), resultStreamKey, event.eventId(),
+				payload.orderId(), payload.outcome(), recordId);
 
 		return recordId;
 	}
