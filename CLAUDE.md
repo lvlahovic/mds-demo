@@ -43,6 +43,26 @@ Implementirano (potvrđeno kroz `find` i `git log`):
   pokušaja), `messaging.ProcessedOrdersStore` (idempotency), `messaging.StreamInitializer`,
   `config.InventorySeedInitializer`, `config.RedisStreamListenerConfig`,
   `config.RedisStreamProperties`, `config.RetryProperties`, testovi za sve gore navedeno.
+- **Povratna sprega o rezervaciji (backlog stavka 1) — DONE, 2026-08-18.**
+  `inventory-service` objavljuje ishod na `order-results-stream`
+  (`messaging.ReservationResultPublisher`), `order-service` ga konzumira preko
+  consumer grupe `order-service-group` (`messaging.ReservationResultConsumer`,
+  `ReservationResultProcessor`, `ResultStreamInitializer`,
+  `config.ResultStreamListenerConfig`). `OrderStatus` prosiren sa `RESERVED`,
+  `REJECTED_INSUFFICIENT_STOCK`, `REJECTED_UNKNOWN_ITEM`, `FAILED` + `isTerminal()`,
+  `Order` dobio `statusReason`/`updatedAt`. `ProcessedOrdersStore` je sada
+  `Map<orderId, ReservationOutcome>` (duplikat ne rezervise ponovo ali PONOVO
+  objavljuje ishod), `PendingMessagesReclaimer` emituje `FAILED` kad salje u DLQ.
+  Opcioni deo: `GET /orders/{orderId}/status` kao SSE
+  (`web.OrderStatusStream` + `services.OrderStatusChangedEvent`, in-JVM Spring event
+  da web sloj zavisi od servisnog, a ne obrnuto).
+- **Usput ispravljen jos jedan realan bag:** `InventorySeedInitializer` je bio
+  `CommandLineRunner`, koji se izvrsava TEK posle refresh-a konteksta — a stream
+  listener container krece da konzumira ranije. Pri restartu sa zaostalim porukama
+  na `orders-stream` narudzbine su obradjivane nad praznim inventarom i odbijane kao
+  `ITEM_NOT_FOUND`. Sada je `@PostConstruct` + `@DependsOn` na listener container-u.
+  Otkriveno tek kroz ovu stavku, jer je rezultat ranije zivio samo u logu.
+
 - Dockerfile-ovi za oba servisa, root `docker-compose.yml` (redis:8-alpine +
   `--appendonly yes` + oba servisa).
 - README.md sa uputstvom i arhitekturom.
@@ -63,6 +83,20 @@ kandidat koristi u produkciji, može autentično da ga objasni na razgovoru.
 - Idempotencija: in-memory `Set<String>` obrađenih `orderId` (ProcessedOrdersStore).
 - Retry/DLQ: `@Scheduled` proverava `XPENDING` za poruke starije od praga, `XCLAIM` + retry do N
   puta, zatim `XADD` u `orders-stream-dlq`.
+
+**Povratna sprega: drugi stream u suprotnom smeru** (`order-results-stream`), ne HTTP
+callback (vratio bi sinhrono spregu koju broker upravo uklanja) i ne deljeni Redis kljuc
+koji `order-service` anketira (nema redosleda, redelivery-ja ni backlog-a). Redosled u
+`OrderEventProcessor` je namerno: rezervisi → upamti ishod lokalno → `XADD` rezultat →
+`XACK` narudzbinu; ako `XADD` pukne, poruka ostaje u PEL-u i redelivery ponovo objavi
+zapamceni ishod umesto da rezervise dvaput. `order-service` na startu drenira sopstveni
+PEL (`ResultStreamInitializer`), jer live listener cita samo neisporucene poruke.
+
+**SSE, ne WebSocket** za `GET /orders/{orderId}/status`: saobracaj je jednosmeran, obican
+HTTP bez upgrade-a, `EventSource` se sam rekonektuje, a veza se zatvara cim narudzbina
+udje u terminalno stanje (ogranicena pretplata, ne otvoreni kanal). Prvo se salje trenutni
+snapshot pa tek onda promene — zato je endpoint bezbedan za poziv u bilo kom trenutku.
+
 
 **Struktura repoa: dva nezavisna sibling foldera, BEZ parent pom-a.** Multi-module Maven je
 namerno odbijen (veštački bi vezao build dva servisa koja treba da budu nezavisna). Svaki servis
@@ -106,6 +140,13 @@ fajl izmenjen):
    do detalja (redosled: messaging paket u oba servisa, pa PendingMessagesReclaimer logika, pa
    docker-compose/Dockerfile odluke). Ovo je jedina preostala, trajno otvorena stavka — nije
    nešto što Claude Code radi umesto kandidata.
+
+6. Backlog produkcijskih mehanizama (memorija `mds-production-grade-backlog`, jedna
+   stavka po sesiji): stavka 1 (povratna sprega + SSE) je zavrsena 2026-08-18 i
+   verifikovana end-to-end kroz `docker compose` — happy path, nedovoljna kolicina,
+   nepoznat artikal, duplikat (ponovno objavljivanje ishoda bez duple rezervacije),
+   SSE preko restarta konzumera, i ceo lanac retry → DLQ → `FAILED` sa poison porukom.
+   Sledeca na redu je stavka 2 (event envelope + versioning).
 
 ## Napomene / ograničenja
 

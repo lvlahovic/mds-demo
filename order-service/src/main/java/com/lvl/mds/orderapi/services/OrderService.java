@@ -6,6 +6,9 @@ import com.lvl.mds.orderapi.messaging.OrderEventPublisher;
 import com.lvl.mds.orderapi.model.Order;
 import com.lvl.mds.orderapi.model.OrderStatus;
 import com.lvl.mds.orderapi.repository.OrderRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
@@ -15,10 +18,9 @@ import java.util.Optional;
 
 /**
  * CRUD over order-service's own bookkeeping ({@link OrderRepository}), plus
- * the side effect of publishing to the broker on creation. Basic
- * create/read/delete are exposed through {@code OrdersController}; update
- * exists here for completeness of the CRUD layer even without a dedicated
- * endpoint for it yet.
+ * the side effect of publishing to the broker on creation and the state
+ * transitions driven by reservation results coming back from
+ * inventory-service.
  *
  * <p>{@link Order} is the internal domain model and never leaves this
  * class - every method here returns {@link OrderResponseDto} instead, so
@@ -27,12 +29,18 @@ import java.util.Optional;
 @Service
 public class OrderService {
 
+	private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
 	private final OrderRepository orderRepository;
 	private final OrderEventPublisher orderEventPublisher;
+	private final ApplicationEventPublisher applicationEventPublisher;
 
-	public OrderService(OrderRepository orderRepository, OrderEventPublisher orderEventPublisher) {
+	public OrderService(OrderRepository orderRepository,
+			OrderEventPublisher orderEventPublisher,
+			ApplicationEventPublisher applicationEventPublisher) {
 		this.orderRepository = orderRepository;
 		this.orderEventPublisher = orderEventPublisher;
+		this.applicationEventPublisher = applicationEventPublisher;
 	}
 
 	/**
@@ -51,7 +59,7 @@ public class OrderService {
 		orderRepository.save(order);
 
 		orderEventPublisher.publish(request);
-		order.setStatus(OrderStatus.PUBLISHED);
+		order.setStatus(OrderStatus.PUBLISHED, "published to orders-stream");
 		orderRepository.save(order);
 
 		return OrderResponseDto.from(order);
@@ -65,12 +73,40 @@ public class OrderService {
 		return orderRepository.findAll().stream().map(OrderResponseDto::from).toList();
 	}
 
-	public OrderResponseDto updateStatus(String orderId, OrderStatus status) {
-		Order order = orderRepository.findById(orderId)
-				.orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order '" + orderId + "' not found"));
-		order.setStatus(status);
+	/**
+	 * Applies a reservation outcome received over {@code order-results-stream}.
+	 *
+	 * <p>Two deliberate no-ops, because at-least-once delivery makes both
+	 * routine rather than exceptional:
+	 * <ul>
+	 *   <li>an unknown orderId (the order was deleted, or this service was
+	 *       restarted and lost its in-memory state) is logged and ignored -
+	 *       the message is still acknowledged by the caller, since retrying it
+	 *       would never start succeeding;</li>
+	 *   <li>an order already in a terminal state keeps its first answer. A
+	 *       redelivered result is by definition the same decision, and this
+	 *       also stops a late duplicate from resurrecting a finished order.</li>
+	 * </ul>
+	 *
+	 * @return whether the order actually changed state
+	 */
+	public boolean applyReservationResult(String orderId, OrderStatus status, String reason) {
+		Order order = orderRepository.findById(orderId).orElse(null);
+		if (order == null) {
+			log.warn("Received reservation result {} for unknown order {} - ignoring", status, orderId);
+			return false;
+		}
+		if (order.getStatus().isTerminal()) {
+			log.info("Order {} is already {} - ignoring duplicate result {}", orderId, order.getStatus(), status);
+			return false;
+		}
+
+		order.setStatus(status, reason);
 		orderRepository.save(order);
-		return OrderResponseDto.from(order);
+		log.info("Order {} is now {} ({})", orderId, status, reason);
+
+		applicationEventPublisher.publishEvent(new OrderStatusChangedEvent(OrderResponseDto.from(order)));
+		return true;
 	}
 
 	public boolean deleteOrder(String orderId) {

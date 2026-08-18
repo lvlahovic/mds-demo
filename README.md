@@ -8,6 +8,10 @@ communicate through Redis Streams:
 - **inventory-service** consumes those events, simulates a stock reservation
   (enough quantity on hand → reserved, otherwise rejected) and keeps
   inventory in memory.
+- **inventory-service** then publishes the outcome back on a second stream,
+  which **order-service** consumes to move the order into a real terminal
+  state - so `GET /orders/{orderId}` answers what actually happened, and
+  `GET /orders/{orderId}/status` streams it live.
 
 The brief for this exercise scoped evaluation to the **quality and
 reliability of the integration** between the two services, not the business
@@ -28,7 +32,7 @@ This starts three containers:
 | Service            | Port  | Role                                         |
 |---------------------|-------|-----------------------------------------------|
 | `redis`             | 6379  | Broker (Redis Streams), AOF persistence on   |
-| `order-service`     | 8080  | `POST /orders`                                |
+| `order-service`     | 8080  | `POST /orders`, order status (incl. SSE)      |
 | `inventory-service` | -     | Background consumer, no HTTP surface          |
 
 Send a request (also available as `order-service/src/main/java/com/lvl/mds/orderapi/request.http`
@@ -42,9 +46,37 @@ curl -i -X POST http://localhost:8080/orders \
 
 `order-service` responds `202 Accepted` as soon as the event is durably
 published - that only means the order was handed off, not that stock was
-reserved. Watch `docker compose logs -f inventory-service` to see the actual
-reservation outcome (`RESERVED` / rejected for insufficient stock / rejected
-for an unknown item).
+reserved. The reservation outcome comes back asynchronously on
+`order-results-stream`, so read it from the order itself:
+
+```bash
+curl -s http://localhost:8080/orders/order-1
+```
+
+```json
+{"orderId":"order-1","itemId":"item-1","quantity":2,"status":"RESERVED",
+ "statusReason":"reserved 2 of item 'item-1'","updatedAt":"2026-08-18T12:00:00.123Z"}
+```
+
+Or subscribe instead of polling - the stream sends the current status
+immediately, then every change, and closes once the order is decided:
+
+```bash
+curl -N http://localhost:8080/orders/order-1/status
+```
+
+```
+event:status
+data:{"orderId":"order-1", ... ,"status":"PUBLISHED", ...}
+
+event:status
+data:{"orderId":"order-1", ... ,"status":"RESERVED", ...}
+```
+
+Order statuses: `CREATED` (accepted locally, not yet published) →
+`PUBLISHED` (on the broker, awaiting a decision) → `RESERVED`,
+`REJECTED_INSUFFICIENT_STOCK`, `REJECTED_UNKNOWN_ITEM`, or `FAILED`
+(inventory-service dead-lettered it without ever deciding).
 
 Seeded inventory (`inventory-service`, in-memory, resets on restart):
 
@@ -75,9 +107,12 @@ problem in my day job, so it's the one I can defend in the most depth.
   group's Pending Entries List (PEL) instead of being lost.
 - **Idempotency.** Because consumer-group redelivery (or a producer retry)
   can hand the same `orderId` to `inventory-service` twice,
-  `ProcessedOrdersStore` keeps an in-memory `Set<String>` of already-handled
-  `orderId`s. A duplicate delivery is recognized, skipped, and still
-  acknowledged.
+  `ProcessedOrdersStore` keeps an in-memory `Map<orderId, outcome>` of
+  already-handled orders. A duplicate delivery does not reserve stock a
+  second time - but it does re-publish the stored outcome, because a
+  redelivery happens precisely when the first attempt didn't finish cleanly,
+  which is also the case where `order-service` may never have received the
+  result.
 - **Retry / dead-letter queue.** `PendingMessagesReclaimer` is a
   `@Scheduled` job that inspects `XPENDING` every `inventory.retry.scan-interval-ms`
   (default 10s) for entries idle longer than
@@ -86,7 +121,9 @@ problem in my day job, so it's the one I can defend in the most depth.
   them through the same processing path the live consumer uses. Once a
   message's delivery count exceeds `inventory.retry.max-attempts` (default
   3), it is written to `orders-stream-dlq` instead and acknowledged off the
-  original stream, so a permanently-failing message can't spin forever.
+  original stream, so a permanently-failing message can't spin forever. It
+  also emits a `FAILED` result, because giving up is still an answer that
+  `order-service` is waiting for.
 - **AOF persistence.** `redis-server --appendonly yes` so `orders-stream`
   (and the consumer group's cursor/PEL) survive a Redis container restart.
 - **`redis:8-alpine`.** Redis was dual-licensed under RSALv2/SSPLv1 (not an
@@ -94,6 +131,56 @@ problem in my day job, so it's the one I can defend in the most depth.
   2025) restored an AGPLv3 option, which is OSI-approved - so the compose
   file pins `redis:8-alpine` specifically to satisfy the task's "open-source
   broker" requirement, not just "any Redis image".
+
+### The reservation result comes back over a second stream
+
+`inventory-service` publishes every decision to `order-results-stream`, and
+`order-service` consumes it through its own `order-service-group` consumer
+group - the same mechanics as the outbound leg, mirrored. Without it,
+`order-service` could only ever claim "handed to the broker" and the actual
+reservation outcome lived nowhere but the consumer's log.
+
+Two alternatives were considered and dropped:
+
+- **An HTTP callback from `inventory-service` to `order-service`.** It
+  re-introduces exactly the synchronous coupling the broker exists to remove:
+  `inventory-service` would need to know where `order-service` lives, be
+  blocked by it being down, and grow its own retry/timeout machinery next to
+  the one Redis Streams already provides.
+- **A shared Redis key that `order-service` polls.** No ordering, no
+  redelivery, no backlog while the reader is down - it throws away everything
+  that made Streams the right choice in the first place.
+
+The ordering inside `inventory-service` is deliberate: reserve → record the
+outcome locally → `XADD` the result → `XACK` the order. If the result `XADD`
+fails, the order event stays in the PEL, and the redelivery finds the
+recorded outcome and re-publishes the result instead of reserving twice.
+
+`order-service` treats a result for an unknown order, and a second result for
+an order that already has an answer, as routine no-ops rather than errors -
+under at-least-once delivery both are normal traffic. Its startup also drains
+its own pending entries, since the live listener only ever reads
+never-delivered messages and anything left unacknowledged by a crash would
+otherwise sit in the PEL forever.
+
+### `GET /orders/{orderId}/status` as Server-Sent Events
+
+Since the outcome arrives asynchronously, the alternative for a client is to
+poll `GET /orders/{orderId}` until the status stops being `PUBLISHED`. The SSE
+endpoint sends the current status immediately, then every change, then closes
+the connection once the order reaches a terminal state - a bounded
+subscription, not an open-ended channel.
+
+SSE rather than WebSockets because the traffic is strictly one-way, it is
+plain HTTP (no protocol upgrade, no extra dependency), and `EventSource`
+reconnects on its own. Sending the snapshot before following updates is what
+makes the endpoint safe to call at any moment, including after the result has
+already arrived.
+
+Internally the messaging layer doesn't know the endpoint exists: `OrderService`
+publishes an in-JVM `OrderStatusChangedEvent`, and `OrderStatusStream` in the
+`web` package subscribes to it. That keeps the dependency pointing from web to
+services rather than the other way around.
 
 ### Sibling folders, not a Maven multi-module build
 
@@ -121,12 +208,14 @@ These were exercised by hand against `docker compose up --build`:
 
 1. **Happy path** - `POST /orders` with `quantity` within stock →
    `202 Accepted`, `inventory-service` logs `RESERVED`, available quantity
-   for that item decreases.
+   for that item decreases, and the order flips to `RESERVED` on
+   `GET /orders/{orderId}` and on an open SSE stream.
 2. **Insufficient stock** - request a quantity above what's seeded (e.g.
    `item-3`, seeded at 5, requested at 999) → event is still published and
    `202 Accepted` returned (publishing only means "accepted for
    processing"), `inventory-service` logs a rejection for insufficient
-   stock; no quantity is deducted.
+   stock; no quantity is deducted, and the order ends as
+   `REJECTED_INSUFFICIENT_STOCK` with the reason filled in.
 3. **Consumer crash mid-processing** - stop `inventory-service`
    (`docker compose stop inventory-service`) while a message is in-flight
    or unacknowledged, then start it back up
@@ -136,14 +225,22 @@ These were exercised by hand against `docker compose up --build`:
    `order-service`.
 4. **Duplicate delivery** - the same `orderId` arriving twice (simulated by
    re-publishing manually via `redis-cli XADD`) is reserved once; the
-   second delivery is logged as a skipped duplicate and still acknowledged.
+   second delivery is logged as a duplicate and still acknowledged, and the
+   stored outcome is re-published so the result can't be lost with it.
+5. **Live status stream** - `curl -N http://localhost:8080/orders/order-1/status`
+   opened right after `POST /orders` receives `PUBLISHED` immediately, then
+   the terminal status as soon as `inventory-service` reports back, then the
+   connection closes. Opening it after the fact yields one event and closes.
 
 ## Assumptions
 
 - No database is required or used - both services are explicitly allowed
   to keep state in memory per the task description, so it resets on
-  restart (inventory levels, processed-order idempotency set, and Redis
-  Streams if the `redis-data` volume is removed).
+  restart (inventory levels, the processed-order outcomes, the orders
+  themselves, and Redis Streams if the `redis-data` volume is removed).
+  This is also why `order-service` losing its orders on restart makes
+  drained result messages unmatchable - with a real store the same code
+  becomes a genuine recovery path.
 - `order-service` validates `orderId`/`itemId` (non-blank) and `quantity`
   (positive integer) and returns `400 Bad Request` on invalid input,
   before anything is published.
@@ -153,6 +250,16 @@ These were exercised by hand against `docker compose up --build`:
   requirement and hasn't been load-tested here.
 - "Reservation" is simulated: it decrements an in-memory counter, it does
   not model holds, expiry, or compensating release-on-cancel flows.
+- SSE subscriptions live in the single `order-service` instance holding the
+  connection. With more than one instance behind a load balancer, a client
+  could subscribe to an instance that never consumes that order's result;
+  making that work would mean broadcasting status changes to every instance
+  (a Redis Pub/Sub fan-out on top of the durable stream) - out of scope
+  here, and called out rather than hidden.
+- The SSE connection is closed by the server after
+  `order.status-stream.timeout-ms` (default 5 min) if the order hasn't been
+  decided by then; a standard `EventSource` client reconnects and gets a
+  fresh snapshot.
 
 ## AI usage note
 

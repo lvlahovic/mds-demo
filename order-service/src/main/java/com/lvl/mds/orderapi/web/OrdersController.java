@@ -5,6 +5,7 @@ import com.lvl.mds.orderapi.dto.OrderResponseDto;
 import com.lvl.mds.orderapi.services.OrderService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -13,6 +14,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
 
@@ -21,16 +23,20 @@ import java.util.List;
 public class OrdersController {
 
 	private final OrderService orderService;
+	private final OrderStatusStream orderStatusStream;
 
-	public OrdersController(OrderService orderService) {
+	public OrdersController(OrderService orderService, OrderStatusStream orderStatusStream) {
 		this.orderService = orderService;
+		this.orderStatusStream = orderStatusStream;
 	}
 
 	/**
 	 * Accepts an order and publishes it to the broker. Returns 202 Accepted -
 	 * reservation is processed asynchronously by the Inventory Processing
 	 * Service, so success here only means the event was durably published,
-	 * not that stock was reserved.
+	 * not that stock was reserved. The reservation outcome arrives later, over
+	 * the result stream; watch for it with {@link #streamOrderStatus} or poll
+	 * {@link #getOrder}.
 	 */
 	@PostMapping
 	public ResponseEntity<OrderResponseDto> createOrder(@Valid @RequestBody OrderRequestDto request) {
@@ -48,6 +54,17 @@ public class OrdersController {
 		return orderService.getOrder(orderId)
 				.map(ResponseEntity::ok)
 				.orElseGet(() -> ResponseEntity.notFound().build());
+	}
+
+	/**
+	 * Streams the order's status as Server-Sent Events: the current state
+	 * immediately, then every change, then the connection closes once the
+	 * order reaches a terminal state. Saves clients from polling
+	 * {@link #getOrder} while the reservation is being processed.
+	 */
+	@GetMapping(value = "/{orderId}/status", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+	public SseEmitter streamOrderStatus(@PathVariable String orderId) {
+		return orderStatusStream.subscribe(orderId);
 	}
 
 	@DeleteMapping("/{orderId}")

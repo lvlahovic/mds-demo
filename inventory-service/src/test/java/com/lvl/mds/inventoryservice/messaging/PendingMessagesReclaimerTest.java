@@ -31,7 +31,7 @@ import static org.mockito.Mockito.verify;
 class PendingMessagesReclaimerTest {
 
 	private static final RedisStreamProperties STREAM_PROPS =
-			new RedisStreamProperties("orders-stream", "orders-stream-dlq", "inventory-service-group", "consumer-1");
+			new RedisStreamProperties("orders-stream", "orders-stream-dlq", "order-results-stream", "inventory-service-group", "consumer-1");
 	private static final RetryProperties RETRY_PROPS = new RetryProperties(30_000, 10_000, 3);
 
 	@Test
@@ -41,6 +41,7 @@ class PendingMessagesReclaimerTest {
 		StreamOperations<String, String, String> streamOps = mock(StreamOperations.class);
 		doReturn(streamOps).when(redisTemplate).opsForStream();
 		OrderEventProcessor processor = mock(OrderEventProcessor.class);
+		ReservationResultPublisher resultPublisher = mock(ReservationResultPublisher.class);
 
 		RecordId id = RecordId.of("1-1");
 		PendingMessage stale = new PendingMessage(id, Consumer.from("inventory-service-group", "ghost"),
@@ -54,7 +55,7 @@ class PendingMessagesReclaimerTest {
 		doReturn(List.of(record)).when(streamOps)
 				.claim(eq("orders-stream"), eq("inventory-service-group"), eq("consumer-1"), any(Duration.class), eq(id));
 
-		PendingMessagesReclaimer reclaimer = new PendingMessagesReclaimer(redisTemplate, processor, STREAM_PROPS, RETRY_PROPS);
+		PendingMessagesReclaimer reclaimer = new PendingMessagesReclaimer(redisTemplate, processor, resultPublisher, STREAM_PROPS, RETRY_PROPS);
 		reclaimer.reclaimStalePendingMessages();
 
 		verify(processor).process(record);
@@ -69,6 +70,7 @@ class PendingMessagesReclaimerTest {
 		StreamOperations<String, String, String> streamOps = mock(StreamOperations.class);
 		doReturn(streamOps).when(redisTemplate).opsForStream();
 		OrderEventProcessor processor = mock(OrderEventProcessor.class);
+		ReservationResultPublisher resultPublisher = mock(ReservationResultPublisher.class);
 
 		RecordId id = RecordId.of("2-1");
 		// deliveryCount (4) > maxAttempts (3)
@@ -83,11 +85,12 @@ class PendingMessagesReclaimerTest {
 		doReturn(List.of(record)).when(streamOps)
 				.claim(eq("orders-stream"), eq("inventory-service-group"), eq("consumer-1"), any(Duration.class), eq(id));
 
-		PendingMessagesReclaimer reclaimer = new PendingMessagesReclaimer(redisTemplate, processor, STREAM_PROPS, RETRY_PROPS);
+		PendingMessagesReclaimer reclaimer = new PendingMessagesReclaimer(redisTemplate, processor, resultPublisher, STREAM_PROPS, RETRY_PROPS);
 		reclaimer.reclaimStalePendingMessages();
 
 		verify(processor, never()).process(any());
 		verify(streamOps).add(argThat((MapRecord<String, String, String> r) -> r.getStream().equals("orders-stream-dlq")));
+		verify(resultPublisher).publishFailure(eq(record), argThat(reason -> reason.contains("max delivery attempts")));
 		verify(streamOps).acknowledge("orders-stream", "inventory-service-group", id);
 	}
 }

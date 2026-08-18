@@ -11,9 +11,27 @@ Content-Type: application/json
 
 GET http://localhost:8080/orders
 
-### Get a single order
+### Get a single order (status is filled in once inventory-service reports back)
 
 GET http://localhost:8080/orders/123
+
+### Watch an order's status live instead of polling the call above.
+### Sends the current status right away, then every change, then closes
+### as soon as the order reaches a terminal state.
+
+GET http://localhost:8080/orders/123/status
+Accept: text/event-stream
+
+### Rejected by inventory-service: item-3 is seeded with only 5
+
+POST http://localhost:8080/orders
+Content-Type: application/json
+
+{
+  "orderId": "124",
+  "itemId": "item-3",
+  "quantity": 999
+}
 
 ### Delete an order
 

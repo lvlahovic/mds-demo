@@ -17,7 +17,7 @@ import static org.mockito.Mockito.mock;
 class StreamInitializerTest {
 
 	private final RedisStreamProperties properties =
-			new RedisStreamProperties("orders-stream", "orders-stream-dlq", "inventory-service-group", "consumer-1");
+			new RedisStreamProperties("orders-stream", "orders-stream-dlq", "order-results-stream", "inventory-service-group", "consumer-1");
 
 	/**
 	 * Regression test: Spring Data Redis wraps the driver's BUSYGROUP error

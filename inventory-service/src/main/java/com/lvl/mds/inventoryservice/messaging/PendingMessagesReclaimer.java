@@ -36,15 +36,18 @@ public class PendingMessagesReclaimer {
 
 	private final StreamOperations<String, String, String> streamOps;
 	private final OrderEventProcessor processor;
+	private final ReservationResultPublisher resultPublisher;
 	private final RedisStreamProperties streamProperties;
 	private final RetryProperties retryProperties;
 
 	public PendingMessagesReclaimer(StringRedisTemplate redisTemplate,
 			OrderEventProcessor processor,
+			ReservationResultPublisher resultPublisher,
 			RedisStreamProperties streamProperties,
 			RetryProperties retryProperties) {
 		this.streamOps = redisTemplate.opsForStream();
 		this.processor = processor;
+		this.resultPublisher = resultPublisher;
 		this.streamProperties = streamProperties;
 		this.retryProperties = retryProperties;
 	}
@@ -99,11 +102,19 @@ public class PendingMessagesReclaimer {
 	}
 
 	private void moveToDlq(MapRecord<String, String, String> record) {
+		String failureReason = "exceeded max delivery attempts (" + retryProperties.maxAttempts() + ")";
+
 		Map<String, String> dlqFields = new LinkedHashMap<>(record.getValue());
 		dlqFields.put("originalStreamId", record.getId().getValue());
-		dlqFields.put("failureReason", "exceeded max delivery attempts (" + retryProperties.maxAttempts() + ")");
+		dlqFields.put("failureReason", failureReason);
 
 		streamOps.add(MapRecord.create(streamProperties.dlqStreamKey(), dlqFields));
+
+		// Dead-lettering is still an answer, and order-service is waiting for
+		// one - without it the order would sit in PUBLISHED indefinitely even
+		// though this service has stopped trying.
+		resultPublisher.publishFailure(record, failureReason);
+
 		streamOps.acknowledge(streamProperties.streamKey(), streamProperties.consumerGroup(), record.getId());
 
 		log.error("Order permanently failed after exceeding retry attempts - moved to DLQ '{}': streamId={}, fields={}",
