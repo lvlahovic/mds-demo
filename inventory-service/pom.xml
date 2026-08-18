@@ -38,6 +38,15 @@
 			<artifactId>spring-boot-starter-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!-- Real Redis in a container for RedisStreamIntegrationTest - the unit
+		     tests elsewhere mock StreamOperations, this one does not. Version
+		     comes from spring-boot-starter-parent's dependency management. -->
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>testcontainers-junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 
 	<build>

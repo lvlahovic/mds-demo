@@ -141,6 +141,29 @@ Implementirano (potvrđeno kroz `find` i `git log`):
 - README.md sa uputstvom i arhitekturom.
 - Usput ispravljen realan bag: pogrešna detekcija BUSYGROUP greške pri restartu servisa
   (consumer group već postoji u Redis-u nakon restarta — sad se to ispravno hvata).
+- **Testcontainers integracioni test (backlog stavka 11) — DONE, 2026-08-18.**
+  `inventory-service/src/test/java/.../integration/RedisStreamIntegrationTest.java`,
+  jedina test klasa u projektu koja diže pravi Redis (`redis:8-alpine`, isti image kao
+  `docker-compose.yml`) preko `@Testcontainers`/`GenericContainer` umesto mokovanja
+  `StreamOperations` kao sto rade svi ostali testovi. `@SpringBootTest` diže ceo pravi
+  kontekst (consumer group creation, live listener, reclaim job), test ga vozi samo
+  spolja preko stream-ova. Tri scenarija: end-to-end rezervacija (RESERVED), end-to-end
+  odbijanje zbog nedovoljne kolicine (INSUFFICIENT_STOCK), i simulirani pad konzumera →
+  redelivery — poruka procitana pod "ghost" konzumentom koji nikad ne radi `XACK`
+  (isti manuelni test koji je ranije rucno vozjen protiv `docker compose`, ovde
+  deterministicki), pa `PendingMessagesReclaimer` (sa skracenim `inventory.retry.*`
+  pragovima kroz `@DynamicPropertySource`, inace bi test cekao realnih 30s+10s) radi
+  `XCLAIM` i uspesno reprocesira. Da ghost-read sigurno pobedi u trci sa live listener-om
+  za istu poruku (oba citaju iz iste consumer grupe), `StreamListenerLifecycle` bean se
+  privremeno zaustavlja (`stop()`) pre ghost-citanja i vraca (`start()`) u `finally` bloku
+  — bez toga bi test bio flaky. Dependency: `org.testcontainers:testcontainers-junit-jupiter`
+  bez eksplicitne verzije (spring-boot-starter-parent 4.1.0 nasledjuje `testcontainers-bom`
+  2.0.5 preko `spring-boot-dependencies`). Gotcha: artifact se u toj BOM verziji zove
+  `testcontainers-junit-jupiter`, ne `junit-jupiter` (stariji naziv, i dalje postoji samo u
+  testcontainers-bom 1.16.1) — Maven greska "version is missing" je bila trag. Verifikovano:
+  cela `inventory-service` test svita (27 testova, ukljucujuci ovaj) prolazi
+  (`mvnw test`, exit 0). `order-service` nije dobio ekvivalentan test u ovoj sesiji - videti
+  napomenu u backlog memoriji `mds-production-grade-backlog` za predlog sledece stavke.
 
 ## Arhitektonske odluke (zaključane, ne preispitivati bez razloga)
 
@@ -225,7 +248,11 @@ fajl izmenjen):
    stavka po sesiji" iz backlog memorije, ali nista nije izgubljeno. Stavka 6 (RFC 7807
    ProblemDetail + @RestControllerAdvice) je zavrsena 2026-08-18, opisana iznad — working
    tree je bio cist pre pocetka, metod "jedna stavka po sesiji" je ponovo ispostovan.
-   Preostale stavke (3, 4, 7-12) i dalje cekaju, redosled izmedju njih nije fiksiran.
+   Stavka 11 (Testcontainers integracioni test) je takodje zavrsena 2026-08-18, opisana
+   iznad — na kandidatov eksplicitan zahtev NIJE komitovana u ovoj sesiji (samo
+   `inventory-service/pom.xml` i novi test fajl stoje u working tree-u); komit ostaje na
+   kandidatu. Preostale stavke (3, 4, 7-10, 12) i dalje cekaju, redosled izmedju njih nije
+   fiksiran.
 
 ## Napomene / ograničenja
 
